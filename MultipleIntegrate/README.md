@@ -73,8 +73,8 @@ multiple_integrate(x + y, (y, 0, 1 - x), (x, 0, 1))
 ### From source (recommended while the package is not on PyPI)
 
 ```bash
-git clone https://github.com/example/multiple-integrate.git
-cd multiple-integrate
+git clone https://github.com/BhuvaneshBhatt/SymbolicMath/MultipleIntegrate.git
+cd MultipleIntegrate
 pip install -e .
 ```
 
