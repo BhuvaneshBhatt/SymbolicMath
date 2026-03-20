@@ -1,0 +1,145 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
+# ── Project metadata (PEP 621) ────────────────────────────────────────────────
+
+[project]
+name = "MultipleIntegrate"
+version = "2.0.0"
+description = "Symbolic multiple integration for Python"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.10"
+
+authors = [
+    { name = "MultipleIntegrate Contributors" },
+]
+
+keywords = [
+    "symbolic mathematics",
+    "integration",
+    "calculus",
+    "sympy",
+    "computer algebra",
+    "layer-cake formula",
+    "co-area formula",
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "sympy>=1.12",
+]
+
+
+# ── Optional dependency groups ────────────────────────────────────────────────
+
+[project.optional-dependencies]
+
+dev = [
+    "pytest>=7.4",
+    "pytest-timeout>=2.2",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+notebook = [
+    "jupyter>=1.0",
+    "notebook>=7.0",
+    "ipykernel>=6.0",
+    "matplotlib>=3.7",
+]
+
+docs = [
+    "mkdocs>=1.5",
+    "mkdocs-material>=9.5",
+    "pymdown-extensions>=10.7",
+]
+
+all = [
+    "multiple-integrate[dev,notebook,docs]",
+]
+
+
+# ── Project URLs ──────────────────────────────────────────────────────────────
+
+[project.urls]
+"Homepage"      = "https://github.com/BhuvaneshBhatt/SymbolicMath/MultipleIntegrate"
+"Documentation" = "https://BhuvaneshBhatt.github.io/SymbolicMath/MultipleIntegrate"
+"Source"        = "https://github.com/BhuvaneshBhatt/SymbolicMath/MultipleIntegrate"
+"Issue Tracker" = "https://github.com/BhuvaneshBhatt/SymbolicMath/MultipleIntegrate/issues"
+"Changelog"     = "https://github.com/BhuvaneshBhatt/SymbolicMath/MultipleIntegrate/blob/main/docs/changelog.md"
+
+
+# ── Hatchling build ───────────────────────────────────────────────────────────
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/multiple_integrate"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/",
+    "tests/",
+    "notebooks/",
+    "docs/",
+    "README.md",
+    "pyproject.toml",
+    "LICENSE",
+]
+
+
+# ── pytest ────────────────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths   = ["tests"]
+addopts     = "-v --tb=short"
+timeout     = 120
+filterwarnings = [
+    "ignore::UserWarning",
+    "ignore::DeprecationWarning",
+]
+markers = [
+    "slow: marks tests as slow (deselect with -m 'not slow')",
+]
+
+
+# ── ruff ─────────────────────────────────────────────────────────────────────
+
+[tool.ruff]
+src            = ["src"]
+line-length    = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501", "B007"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["multiple_integrate"]
+
+
+# ── mypy ─────────────────────────────────────────────────────────────────────
+
+[tool.mypy]
+mypy_path              = "src"
+packages               = ["multiple_integrate"]
+python_version         = "3.10"
+strict                 = false
+warn_unused_configs    = true
+warn_return_any        = false
+ignore_missing_imports = true
