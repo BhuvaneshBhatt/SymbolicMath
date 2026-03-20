@@ -5,7 +5,7 @@
 MultipleIntegrate is a pure-Python library built on [SymPy](https://www.sympy.org)
 that evaluates $n$-dimensional integrals of the form
 
-$$\int_\Omega f\!\left(g(\mathbf{x})\right)\,d\mathbf{x}$$
+$$\int_\Omega f\left(g(\mathbf{x})\right) d\mathbf{x}$$
 
 in closed symbolic form. Nine specialised strategies are tried in order; the first
 one whose preconditions are satisfied returns an exact result. A plain iterated
@@ -13,8 +13,8 @@ fallback handles all remaining cases.
 
 The key insight unifying all strategies is the **layer-cake / co-area identity**:
 
-$$\int_\Omega f(g(\mathbf{x}))\,d\mathbf{x} = \int f(y)\,\mu'(y)\,dy,
-\qquad \mu(y) = \lambda\!\left(\{\mathbf{x}\in\Omega : g(\mathbf{x})\le y\}\right)$$
+$$\int_\Omega f(g(\mathbf{x})) d\mathbf{x} = \int f(y)\ \mu'(y) dy,
+\qquad \mu(y) = \lambda\left(\{\mathbf{x}\in\Omega : g(\mathbf{x})\le y\}\right)$$
 
 This identity holds for *any* measurable $g$ — polynomial, transcendental, or
 discontinuous. The nine strategies differ only in how they compute $\mu'(y)$.
