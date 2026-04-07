@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liepde"
+version = "0.1.0"
+description = "Standalone Lie-symmetry PDE reduction toolkit extracted from pdesolve"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["sympy>=1.12"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["liepde*"]
