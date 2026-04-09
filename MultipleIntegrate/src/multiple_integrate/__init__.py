@@ -1,46 +1,49 @@
-"""
-multiple_integrate
-==================
-Symbolic multiple integration for Python.
+"""multiple_integrate
+====================
 
-Evaluates n-dimensional integrals of the form
+Symbolic definite integration for Python, with an emphasis on structured
+multiple integrals.
 
-    ∫_Ω f(g(x₁, …, xₙ)) dx
-
-in closed symbolic form using SymPy.  Nine specialised strategies are tried in
-order; the first that applies returns an exact result.  A plain iterated
-fallback handles all remaining cases.
-
-Public API
-----------
-multiple_integrate(f, *ranges, ...)
-    Main entry point.  See ``help(multiple_integrate)`` for full signature.
-
-Decomposition
-    Dataclass returned by the internal decomposition step.  Exposed here for
-    users who want to inspect how an integrand was parsed.
-
-Examples
---------
->>> from sympy import symbols, exp, sin, pi, oo
->>> from multiple_integrate import multiple_integrate
->>> x, y = symbols('x y', real=True)
->>> multiple_integrate(exp(-(x**2 + y**2)), (x, -oo, oo), (y, -oo, oo))
-pi
->>> multiple_integrate(sin(x + y), (x, 0, pi), (y, 0, pi))
-0
+The main public entry point is ``multiple_integrate``.
 """
 
-from multiple_integrate.core import (
-    multiple_integrate,
-    Decomposition,
+from multiple_integrate.core import Decomposition, multiple_integrate
+from multiple_integrate.regions import (
+    AffineSimplexRegion,
+    AnnulusRegion,
+    BallRegion,
+    BoxRegion,
+    DiskRegion,
+    EllipsoidRegion,
+    GraphRegion,
+    IteratedRegion,
+    Region,
+    SimplexRegion,
+    SphericalShellRegion,
+    UnionRegion,
+    boole,
+    region_from_ranges,
 )
 
 __all__ = [
     "multiple_integrate",
     "Decomposition",
+    "Region",
+    "AffineSimplexRegion",
+    "AnnulusRegion",
+    "BallRegion",
+    "BoxRegion",
+    "DiskRegion",
+    "EllipsoidRegion",
+    "GraphRegion",
+    "IteratedRegion",
+    "SimplexRegion",
+    "SphericalShellRegion",
+    "UnionRegion",
+    "boole",
+    "region_from_ranges",
 ]
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __author__ = "Bhuvanesh Bhatt"
 __license__ = "GPL-3.0-or-later"

@@ -1,7 +1,7 @@
 """
 test_reference_examples.py
 --------------------------
-Tests drawn from external reference computations (Wolfram Mathematica).
+Tests drawn from external reference computations (reference CAS).
 
 Covers:
   • Fubini-violation integrals (non-L¹ integrands where order changes the value)

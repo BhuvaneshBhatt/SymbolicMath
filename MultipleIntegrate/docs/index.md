@@ -2,128 +2,162 @@
 
 **Symbolic multiple integration for Python**
 
-MultipleIntegrate is a pure-Python library built on [SymPy](https://www.sympy.org) that evaluates
-$n$-dimensional integrals of the form
+MultipleIntegrate is a pure-Python library built on [SymPy](https://www.sympy.org) for **structured exact definite and multiple integration**. It combines:
 
-$$\int_\Omega f\!\left(g(\mathbf{x})\right)\,d\mathbf{x}$$
+- region recognition for boxes, graphs, simplices, disks, balls, ellipsoids, annuli, and shells
+- direct exact formulas for selected families, especially **Dirichlet/simplex** integrals
+- coordinate-change methods such as **polar**, **spherical**, and selected **affine** transformations
+- symmetry and separability heuristics
+- controlled fallback to `sympy.integrate`
 
-in closed symbolic form using the **layer-cake / co-area identity**
-
-$$\int_\Omega f(g(\mathbf{x}))\,d\mathbf{x} \;=\; \int f(y)\,\mu'(y)\,dy$$
-
-which holds for *any* measurable $g$. The library implements nine strategies that each 
-compute the pushforward density $\mu'(y)$ in a different way suited to the structure of $g$.
+The package is strongest when an integral has recognizable geometric or algebraic structure.
 
 ---
 
 ## Quick start
 
 ```python
-from sympy import symbols, exp, sin, cos, pi, oo, sqrt
+from sympy import symbols, exp, cos, pi, oo, sqrt
 from multiple_integrate import multiple_integrate
 
 x, y, z = symbols('x y z', real=True)
 
-# Polynomial integrand
-multiple_integrate(x**2 * y, (x, 0, 1), (y, 0, 2))          # → 2/3
+# Box / product region
+multiple_integrate(x**2 * y, (y, 0, 2), (x, 0, 1))
 
-# 2-D Gaussian (Strategy 2)
-multiple_integrate(exp(-(x**2 + y**2)), (x, -oo, oo), (y, -oo, oo))   # → π
+# Triangle / simplex
+multiple_integrate(1, (y, 0, 1 - x), (x, 0, 1))
 
-# Separable non-polynomial g (Strategy 5)
-multiple_integrate(cos(x + y), (x, 0, pi), (y, 0, pi))       # → 0
+# Fractional-power simplex / Dirichlet family
+multiple_integrate(
+    x**sp.Rational(1, 2) * y**sp.Rational(1, 3) * (1 - x - y)**sp.Rational(1, 4),
+    (y, 0, 1 - x),
+    (x, 0, 1),
+)
 
-# Monotone substitution (Strategy 6)
-multiple_integrate(1/(1 + x**2), (x, 0, 1))                   # → π/4
+# Full-space Gaussian
+multiple_integrate(exp(-(x**2 + y**2)), (y, -oo, oo), (x, -oo, oo))
 
-# Piecewise-monotone (Strategy 7)
-multiple_integrate(sin(x), (x, 0, pi))                         # → 2
-
-# Triple integral
-multiple_integrate(exp(-(x + y + z)), (x, 0, oo), (y, 0, oo), (z, 0, oo))  # → 1
+# Disk integral handled by polar coordinates
+multiple_integrate(
+    x**2 * y**2 / sqrt(1 - x**2 - y**2),
+    (y, -sqrt(1 - x**2), sqrt(1 - x**2)),
+    (x, -1, 1),
+)
 ```
+
+---
+
+## Range convention
+
+`multiple_integrate` follows the same public convention as `sympy.integrate`:
+range tuples are given in **inner-first iterated order**.
+
+So
+
+```python
+multiple_integrate(expr, (y, 0, 1 - x), (x, 0, 1))
+```
+
+means
+
+\[
+\int_0^1 \left(\int_0^{1-x} \text{expr} \, dy\right) dx.
+\]
+
+The same convention is used by `region_from_ranges(...)`.
 
 ---
 
 ## Installation
 
-MultipleIntegrate requires Python ≥ 3.10 and SymPy ≥ 1.12.
+MultipleIntegrate requires Python >= 3.10 and SymPy >= 1.12.
 
 ```bash
-pip install sympy
-# then place multiple_integrate.py in your project directory or on PYTHONPATH
+pip install -e .
 ```
 
-No other dependencies are needed.
+For development:
+
+```bash
+pip install -e .[dev]
+```
 
 ---
 
-## Project files
+## Repository layout
 
-| File | Description |
+| Path | Description |
 |---|---|
-| `multiple_integrate.py` | Library source — all strategies and public API |
-| `test_multiple_integrate.py` | pytest suite — 138 tests across 18 classes |
-| `multiple_integration.ipynb` | Tutorial notebook with theory and worked examples |
-| `docs/` | This documentation |
+| `src/multiple_integrate/` | Library source |
+| `tests/` | Pytest suite |
+| `notebooks/multiple_integration.ipynb` | Tutorial notebook |
+| `docs/` | Documentation |
 
 ---
 
-## Strategy overview
+## What the library currently does well
 
-Nine strategies are tried in order. The first one whose preconditions are satisfied
-returns the result; the rest are skipped.
+### Region-aware exact methods
 
-| # | Name | When it fires | Key formula |
-|---|---|---|---|
-| 1 | **Linear** | Polynomial $g = \mathbf{b}\cdot\mathbf{x}+c$, domain $[0,\infty)^n$ | Univariate reduction via simplex measure |
-| 2 | **Quadratic doubly-infinite** | Polynomial $g = \mathbf{x}^\top A\mathbf{x}+\cdots$, domain $\mathbb{R}^n$ | Ellipsoid surface-area formula |
-| 3 | **Quadratic even/half-infinite** | Same as 2, mixed $\mathbb{R}/[0,\infty)$ ranges, $f\circ g$ even | Halving by symmetry |
-| 4 | **General polynomial** | Any polynomial $g$, bounded/semi-infinite domain | Heaviside $\mu(y)$ computed by SymPy |
-| 5 | **Separable** | $g = h_1(x_1)+\cdots+h_n(x_n)$, one variable per term | Convolution of marginal densities |
-| 6 | **Monotone substitution** | Single-variable $g$, no interior critical points | Analytic inversion $x = g^{-1}(y)$ |
-| 7 | **Piecewise-monotone** | Single-variable $g$, has critical points | Domain split at critical points, sum branches |
-| 8 | **General non-polynomial** | Multi-variable non-polynomial $g$ | Heaviside $\mu(y)$ computed by SymPy |
-| 9 | **Fallback** | Anything else | Plain iterated `sympy.integrate` |
+The package can recognize several standard domains directly from iterated bounds, including:
 
-Full mathematical derivations for each strategy are in [Theory](theory.md).  
-Precise firing conditions and worked examples are in [Strategies](strategies.md).
+- boxes / product regions
+- graph regions
+- simplices and affine simplices
+- disks and balls
+- ellipsoids
+- annuli and spherical shells
+
+That lets it use geometric formulas instead of blindly nesting 1D antiderivatives.
+
+### Exact simplex / Dirichlet evaluation
+
+A dedicated simplex engine handles many integrals of the form
+
+\[
+\int_\Delta x_1^{a_1-1}\cdots x_n^{a_n-1}(1-x_1-\cdots-x_n)^{a_{n+1}-1}\,dx,
+\]
+
+including fractional exponents when the convergence conditions are clear.
+
+### Coordinate changes
+
+The package includes structured coordinate changes for selected families:
+
+- polar coordinates on disks and annuli
+- spherical coordinates on balls and spherical shells
+- selected affine normalizations, such as ellipsoids
+- selected quadratic Gaussian reductions on full space
+
+### Assumption-aware structured paths
+
+For some exact structured methods, the library now performs basic safety checks before applying a closed form. This is not a complete general convergence engine, but it helps avoid some branch and sign errors on recognized families.
+
+---
+
+## High-level solving flow
+
+The current solver can be thought of as a layered pipeline:
+
+1. Parse ranges using the SymPy convention.
+2. Try to recognize a structured region.
+3. Try exact structured methods for that region.
+4. Try decomposition- and symmetry-based heuristics.
+5. Try selected coordinate changes.
+6. Fall back to `sympy.integrate` when needed.
+
+This is broader than the older "nine strategy" description: the library still uses decomposition-based heuristics internally, but region recognition and coordinate transforms are now equally important parts of the architecture.
 
 ---
 
 ## Documentation contents
 
-- [**Theory**](theory.md) — Mathematical foundations: Riemann integrals, Fubini's theorem,
-  the layer-cake formula, the co-area formula, and the derivation of all nine strategies.
-- [**Strategies**](strategies.md) — Complete reference for each strategy: preconditions,
-  algorithm, formula, examples, and bypass conditions.
-- [**API Reference**](api.md) — Full docstring-level reference for `multiple_integrate`,
-  `Decomposition`, and all internal functions.
-- [**Decomposition**](decomposition.md) — Deep dive into `_decompose`: how the library
-  recognises $f(g(\mathbf{x}))$ structure in a SymPy expression tree.
-- [**Examples**](examples.md) — Worked examples grouped by integrand type: polynomial,
-  trigonometric, exponential, mixed, non-analytic, divergent.
-- [**Testing**](testing.md) — Test suite architecture, how to run tests, coverage map,
-  and guidance on writing new tests.
-- [**Contributing**](contributing.md) — How to add a new strategy, coding conventions,
-  and the internal data flow.
-- [**Changelog**](changelog.md) — Version history and migration notes.
-
----
-
-## Design philosophy
-
-> *The polynomial restriction was a limitation of the decomposition logic,
-> not of the mathematics.*
-
-The original implementation only handled polynomial $g$, but the layer-cake formula
-
-$$\mu(y) = \int_\Omega \mathbf{1}[g(\mathbf{x}) \le y]\,d\mathbf{x},
-\qquad \mu'(y) = \frac{d\mu}{dy}$$
-
-is valid for any measurable $g$. The nine strategies are simply nine different ways 
-of computing $\mu'(y)$ efficiently for different classes of $g$.
-
-The code is intentionally written as a cascade of independent, testable functions
-(`_try_linear`, `_try_separable`, …) rather than a monolithic routine, so that
-new strategies can be added without touching existing ones.
+- [**Theory**](theory.md) — Mathematical background and the main exact families.
+- [**Strategies**](strategies.md) — How the solver chooses between region formulas, transforms, decomposition methods, and fallback.
+- [**API Reference**](api.md) — Public API and major internal data structures.
+- [**Decomposition**](decomposition.md) — Notes on the integrand decomposition logic.
+- [**Examples**](examples.md) — Worked examples by family.
+- [**Testing**](testing.md) — Test-suite structure and running tests.
+- [**Contributing**](contributing.md) — Project layout and development guidance.
+- [**Changelog**](changelog.md) — Version history.

@@ -14,17 +14,20 @@ license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.10"
 
 authors = [
-    { name = "MultipleIntegrate Contributors" },
+    { name = "Bhuvanesh Bhatt" }
 ]
 
 keywords = [
     "symbolic mathematics",
+    "symbolic computation",
     "integration",
+    "definite integration",
+    "multiple integrals",
     "calculus",
     "sympy",
     "computer algebra",
     "layer-cake formula",
-    "co-area formula",
+    "co-area formula"
 ]
 
 classifiers = [
@@ -39,11 +42,11 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Mathematics",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "Typing :: Typed",
+    "Typing :: Typed"
 ]
 
 dependencies = [
-    "sympy>=1.12",
+    "sympy>=1.12"
 ]
 
 
@@ -55,24 +58,24 @@ dev = [
     "pytest>=7.4",
     "pytest-timeout>=2.2",
     "ruff>=0.4",
-    "mypy>=1.10",
+    "mypy>=1.10"
 ]
 
 notebook = [
     "jupyter>=1.0",
     "notebook>=7.0",
     "ipykernel>=6.0",
-    "matplotlib>=3.7",
+    "matplotlib>=3.7"
 ]
 
 docs = [
     "mkdocs>=1.5",
     "mkdocs-material>=9.5",
-    "pymdown-extensions>=10.7",
+    "pymdown-extensions>=10.7"
 ]
 
 all = [
-    "multiple-integrate[dev,notebook,docs]",
+    "multiple-integrate[dev,notebook,docs]"
 ]
 
 
@@ -93,13 +96,13 @@ packages = ["src/multiple_integrate"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/",
+    "src/multiple_integrate/",
     "tests/",
     "notebooks/",
     "docs/",
     "README.md",
     "pyproject.toml",
-    "LICENSE",
+    "LICENSE"
 ]
 
 
@@ -111,14 +114,14 @@ addopts     = "-v --tb=short"
 timeout     = 120
 filterwarnings = [
     "ignore::UserWarning",
-    "ignore::DeprecationWarning",
+    "ignore::DeprecationWarning"
 ]
 markers = [
-    "slow: marks tests as slow (deselect with -m 'not slow')",
+    "slow: marks tests as slow (deselect with -m 'not slow')"
 ]
 
 
-# ── ruff ─────────────────────────────────────────────────────────────────────
+# ── ruff ──────────────────────────────────────────────────────────────────────
 
 [tool.ruff]
 src            = ["src"]
@@ -133,7 +136,7 @@ ignore = ["E501", "B007"]
 known-first-party = ["multiple_integrate"]
 
 
-# ── mypy ─────────────────────────────────────────────────────────────────────
+# ── mypy ──────────────────────────────────────────────────────────────────────
 
 [tool.mypy]
 mypy_path              = "src"

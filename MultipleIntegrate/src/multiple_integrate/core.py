@@ -1,31 +1,10 @@
-"""
-multiple_integrate.py
----------------------
-Symbolic multiple integration of integrands of the form f(g(x₁,…,xₙ)).
-
-Strategies (tried in order):
-  1. Linear polynomial      – f(b·x + c)           over [0,∞)ⁿ
-  2. Quadratic doubly-inf.  – f(xᵀAx + b·x + c)   over (-∞,∞)ⁿ
-  3. Quadratic even/half    – same, exploiting symmetry
-  4. General polynomial     – layer-cake with Heaviside (any poly g)
-  5. Separable g            – g(x) = h₁(x₁) ⊕ h₂(x₂) ⊕ … (+ or ×)
-  6. Monotone substitution  – analytic inversion of g on the domain
-  7. Piecewise-monotone     – split at critical points, sum branches
-  8. General non-polynomial – Heaviside layer-cake (SymPy handles integral)
-  9. Fallback               – plain iterated sympy.integrate
-
-The key insight: the layer-cake / co-area identity
-
-    ∫_Ω f(g(x)) dx  =  ∫ f(y) · μ'(y) dy
-
-holds for *any* measurable g, not just polynomials.  The strategies differ
-only in *how* μ'(y) is computed.
-"""
+"""Core algorithms for exact multiple integration."""
 
 from __future__ import annotations
 
 import functools
 import signal
+from abc import ABC
 import sympy as sp
 from sympy import (
     symbols,
@@ -58,11 +37,73 @@ from sympy import (
 )
 from sympy.matrices import Matrix
 from typing import Callable
+from dataclasses import dataclass
 import warnings
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# §1  Decomposition  –  recognise f(g(x)) for arbitrary g
-# ═══════════════════════════════════════════════════════════════════════════════
+from multiple_integrate.regions import (
+    AffineSimplexRegion,
+    AnnulusRegion,
+    BallRegion,
+    BoxRegion,
+    DiskRegion,
+    EllipsoidRegion,
+    GraphRegion,
+    IteratedRegion,
+    Region,
+    SimplexRegion,
+    SphericalShellRegion,
+    UnionRegion,
+    boole,
+    indicator_condition,
+    restrict_region,
+    region_from_ranges,
+)
+
+
+@dataclass(frozen=True)
+class ChangeOfVariables:
+    src_vars: tuple[sp.Symbol, ...]
+    tgt_vars: tuple[sp.Symbol, ...]
+    forward_map: tuple[sp.Expr, ...] | None
+    inverse_map: tuple[sp.Expr, ...] | None
+    jacobian: sp.Expr | None
+    inv_jacobian: sp.Expr | None
+    conditions: tuple[sp.Expr, ...] = ()
+    name: str = ""
+
+
+class BaseRegion(ABC):
+    pass
+
+
+@dataclass(frozen=True)
+class TransformedIntegral:
+    expr: sp.Expr
+    ranges: tuple[tuple[sp.Symbol, sp.Expr, sp.Expr], ...]
+    region: BaseRegion | None
+    transform: ChangeOfVariables
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CoordinateTransform:
+    """Change-of-variables data for structured cordinate transforms."""
+
+    source_vars: tuple[sp.Symbol, ...]
+    target_vars: tuple[sp.Symbol, ...]
+    forward_map: tuple[sp.Expr, ...]
+    jacobian: sp.Expr
+    target_ranges: tuple[tuple, ...]
+
+    def apply(self, expr: sp.Expr) -> sp.Expr:
+        # The transformed integrand is f(T(u)) * |det DT(u)|.
+        subs = dict(zip(self.source_vars, self.forward_map))
+        transformed = sp.sympify(expr).subs(subs) * self.jacobian
+        try:
+            transformed = sp.trigsimp(sp.factor_terms(sp.cancel(transformed)))
+        except Exception:
+            pass
+        return _fast_simplify(transformed)
 
 
 class Decomposition:
@@ -71,7 +112,7 @@ class Decomposition:
 
     Attributes
     ----------
-    f_outer : Callable   – univariate function, maps SymPy expr → SymPy expr
+    f_outer : Callable   – univariate function, maps SymPy expr -> SymPy expr
     g_inner : sp.Expr    – the "inner" expression in the integration variables
     is_polynomial : bool – True if g_inner is a polynomial in the variables
     """
@@ -84,122 +125,288 @@ class Decomposition:
         self.is_polynomial = is_polynomial
 
 
-def _decompose(expr: sp.Expr, vars_: list[sp.Symbol]) -> Decomposition | None:
-    """
-    Try to write *expr* as f(g(x)) where g depends on vars_ and f is
-    univariate.  Returns a Decomposition or None if no such form is found.
+def _normalize_seq(obj):
+    """Normalize a list/tuple-like input to a tuple."""
+    if isinstance(obj, (list, tuple)):
+        return tuple(obj)
+    return (obj,)
 
-    Detection order
-    ---------------
-    1. Polynomial in vars_            →  f = identity,  g = expr
-    2. Single-argument composite      →  expr = head(arg),  g = arg
-       e.g. exp(x²+y), sin(x-y), log(xy), sqrt(x²+1), …
-    3. Power with exponent free of    →  expr = base**exp,  g = base
-       vars_, base depending on vars_
-    4. Product / sum separable in one →  peel off factors/terms free of vars_,
-       variable at a time               leaving a single-variable remainder
-    5. Rational function              →  g = numerator (if denominator is
-       (single-variable rational)       a function of numerator)
-    """
-    # ── 1. Polynomial ──────────────────────────────────────────────────────────
+
+def _vars_set(vars_: list[sp.Symbol] | tuple[sp.Symbol, ...]) -> set[sp.Symbol]:
+    return set(vars_)
+
+
+def _depends_on_vars(expr: sp.Expr, vars_set: set[sp.Symbol]) -> bool:
+    return bool(sp.sympify(expr).free_symbols & vars_set)
+
+
+def _is_constant_wrt(expr: sp.Expr, vars_set: set[sp.Symbol]) -> bool:
+    return not _depends_on_vars(expr, vars_set)
+
+
+def _clean_expr(expr: sp.Expr) -> sp.Expr:
+    expr = sp.sympify(expr)
     try:
-        p = sp.Poly(expr, *vars_)
+        return sp.simplify(expr)
+    except Exception:
+        return expr
+
+
+def _const_result(expr: sp.Expr, region: Region, parsed_ranges: list[tuple]) -> sp.Expr:
+    volume = region.constant_volume()
+    if volume is None:
+        volume = sp.Integer(1)
+        for _, lo, hi in parsed_ranges:
+            volume *= sp.sympify(hi) - sp.sympify(lo)
+    return _fast_simplify(sp.sympify(expr) * volume)
+
+
+def _inactive_finite_volume(
+    active_vars: list[sp.Symbol],
+    vars_: list[sp.Symbol],
+    ranges: list[tuple],
+) -> sp.Expr | None:
+    """Return the product of inactive finite dimensions when it's safe.
+    This succeeds only when every inactive bound is finite and independent of
+    the active variables, and active bounds do not depend on inactive vars.
+    """
+    active_set = set(active_vars)
+    all_set = set(vars_)
+    inactive_set = all_set - active_set
+    volume = sp.Integer(1)
+    for v, lo, hi in ranges:
+        lo_s = sp.sympify(lo)
+        hi_s = sp.sympify(hi)
+        if v in active_set:
+            if (lo_s.free_symbols | hi_s.free_symbols) & inactive_set:
+                return None
+            continue
+        if lo_s in (-oo, oo) or hi_s in (-oo, oo):
+            return None
+        if (lo_s.free_symbols | hi_s.free_symbols) & active_set:
+            return None
+        volume *= hi_s - lo_s
+    return _fast_simplify(volume)
+
+
+def _should_try_layercake(
+    f_outer: Callable,
+    g: sp.Expr,
+    vars_: list[sp.Symbol],
+    ranges: list[tuple],
+) -> bool:
+    """Entry point for the expensive generic layer-cake fallback."""
+    active_vars = [v for v in vars_ if v in g.free_symbols]
+    if len(active_vars) > 1:
+        return False
+    if (
+        len(active_vars) == 1
+        and _inactive_finite_volume(active_vars, vars_, ranges) is None
+    ):
+        return False
+    return True
+
+
+def _decompose_unary_wrapper(
+    expr: sp.Expr, vars_: list[sp.Symbol], vars_set: set[sp.Symbol]
+) -> Decomposition | None:
+    n_var_args = sum(1 for a in expr.args if _depends_on_vars(a, vars_set))
+    if n_var_args != 1:
+        return None
+    inner = next(a for a in expr.args if _depends_on_vars(a, vars_set))
+    t = Dummy("t")
+    try:
+        outer = sp.Lambda(t, expr.subs(inner, t))
+        return Decomposition(outer, inner, is_polynomial=_is_polynomial(inner, vars_))
+    except Exception:
+        return None
+
+
+def _decompose_mul_constants(
+    expr: sp.Expr, vars_: list[sp.Symbol], vars_set: set[sp.Symbol]
+) -> Decomposition | None:
+    if not expr.is_Mul:
+        return None
+    const_part = sp.Integer(1)
+    var_part = sp.Integer(1)
+    for factor in expr.args:
+        if _depends_on_vars(factor, vars_set):
+            var_part *= factor
+        else:
+            const_part *= factor
+    if const_part == 1 or var_part == 1:
+        return None
+    sub = _decompose(var_part, vars_)
+    if sub is None:
+        return None
+    inner_f = sub.f_outer
+    t = Dummy("t")
+    outer = sp.Lambda(t, const_part * inner_f(t))
+    return Decomposition(outer, sub.g_inner, is_polynomial=sub.is_polynomial)
+
+
+def _decompose_add_constants(
+    expr: sp.Expr, vars_: list[sp.Symbol], vars_set: set[sp.Symbol]
+) -> Decomposition | None:
+    if not expr.is_Add:
+        return None
+    const_part = sp.Integer(0)
+    var_part = sp.Integer(0)
+    for term in expr.args:
+        if _depends_on_vars(term, vars_set):
+            var_part += term
+        else:
+            const_part += term
+    if const_part == 0 or var_part == 0:
+        return None
+    sub = _decompose(var_part, vars_)
+    if sub is None:
+        return None
+    inner_f = sub.f_outer
+    t = Dummy("t")
+    outer = sp.Lambda(t, inner_f(t) + const_part)
+    return Decomposition(outer, sub.g_inner, is_polynomial=sub.is_polynomial)
+
+
+def _decompose_single_var(
+    expr: sp.Expr, vars_: list[sp.Symbol], vars_set: set[sp.Symbol]
+) -> Decomposition | None:
+    active = [v for v in vars_ if v in sp.sympify(expr).free_symbols]
+    if len(active) != 1:
+        return None
+    t = Dummy("t")
+    return Decomposition(
+        sp.Lambda(t, t), expr, is_polynomial=_is_polynomial(expr, vars_)
+    )
+
+
+def _decompose_shallow(expr: sp.Expr, vars_: list[sp.Symbol]) -> Decomposition | None:
+    """Single-pass decomposition used as the base case for recursive peeling."""
+    vars_set = _vars_set(vars_)
+
+    try:
+        sp.Poly(expr, *vars_)
         t = Dummy("t")
         return Decomposition(sp.Lambda(t, t), expr, is_polynomial=True)
     except sp.PolynomialError:
         pass
 
-    # ── 1b. Single-variable logarithm / non-polynomial atomic case ───────────
-    active = [v for v in vars_ if v in expr.free_symbols]
-    if len(active) == 1 and expr.func in (
-        sp.log,
-        sp.Abs,
-        sp.sign,
-        sp.floor,
-        sp.ceiling,
-    ):
-        t = Dummy("t")
-        return Decomposition(
-            sp.Lambda(t, t), expr, is_polynomial=_is_polynomial(expr, vars_)
-        )
+    if expr.func in (sp.log, sp.Abs, sp.sign, sp.floor, sp.ceiling):
+        sub = _decompose_single_var(expr, vars_, vars_set)
+        if sub is not None:
+            return sub
 
-    # ── 2. Single-argument composite  f(arg) ──────────────────────────────────
-    #    Works for exp, sin, cos, tan, log, sqrt (=Pow(·,1/2)), etc.
-    #    Also handles Heaviside(arg, H0) and similar 2-arg wrappers where
-    #    the second argument is a constant (not a variable).
-    _n_var_args = sum(1 for a in expr.args if a.free_symbols & set(vars_))
-    if _n_var_args == 1:
-        # Find the one argument that depends on vars_
-        inner = next(a for a in expr.args if a.free_symbols & set(vars_))
+    sub = _decompose_unary_wrapper(expr, vars_, vars_set)
+    if sub is not None:
+        return sub
+
+    if expr.is_Pow:
+        base, exp_ = expr.args
+        if _is_constant_wrt(exp_, vars_set) and _depends_on_vars(base, vars_set):
+            t = Dummy("t")
+            return Decomposition(
+                sp.Lambda(t, t**exp_), base, is_polynomial=_is_polynomial(base, vars_)
+            )
+
+    sub = _decompose_mul_constants(expr, vars_, vars_set)
+    if sub is not None:
+        return sub
+
+    sub = _decompose_add_constants(expr, vars_, vars_set)
+    if sub is not None:
+        return sub
+
+    return _decompose_single_var(expr, vars_, vars_set)
+
+
+def _decompose(expr: sp.Expr, vars_: list[sp.Symbol]) -> Decomposition | None:
+    """Recursively peel wrappers to expose a deeper public decomposition."""
+    vars_set = _vars_set(vars_)
+
+    if expr.func in (sp.log, sp.Abs, sp.sign, sp.floor, sp.ceiling):
+        sub = _decompose_single_var(expr, vars_, vars_set)
+        if sub is not None:
+            return sub
+
+    n_var_args = sum(1 for a in expr.args if _depends_on_vars(a, vars_set))
+    if n_var_args == 1:
+        inner = next(a for a in expr.args if _depends_on_vars(a, vars_set))
         t = Dummy("t")
         try:
             outer = sp.Lambda(t, expr.subs(inner, t))
-            is_poly = _is_polynomial(inner, vars_)
-            return Decomposition(outer, inner, is_polynomial=is_poly)
+            sub = _decompose(inner, vars_)
+            if sub is not None:
+                u = Dummy("u")
+                try:
+                    return Decomposition(
+                        sp.Lambda(u, outer(sub.f_outer(u))),
+                        sub.g_inner,
+                        sub.is_polynomial,
+                    )
+                except Exception:
+                    pass
+            return Decomposition(
+                outer, inner, is_polynomial=_is_polynomial(inner, vars_)
+            )
         except Exception:
             pass
 
-    # ── 3. Power  base**exp  where exponent is free of vars_ ──────────────────
     if expr.is_Pow:
         base, exp_ = expr.args
-        if not exp_.free_symbols & set(vars_):  # exponent is a constant
-            if base.free_symbols & set(vars_):
-                t = Dummy("t")
-                outer = sp.Lambda(t, t**exp_)
-                is_poly = _is_polynomial(base, vars_)
-                return Decomposition(outer, base, is_polynomial=is_poly)
+        if _is_constant_wrt(exp_, vars_set) and _depends_on_vars(base, vars_set):
+            sub = _decompose(base, vars_)
+            t = Dummy("t")
+            if sub is not None:
+                u = Dummy("u")
+                try:
+                    return Decomposition(
+                        sp.Lambda(u, sub.f_outer(u) ** exp_),
+                        sub.g_inner,
+                        sub.is_polynomial,
+                    )
+                except Exception:
+                    pass
+            return Decomposition(
+                sp.Lambda(t, t**exp_), base, is_polynomial=_is_polynomial(base, vars_)
+            )
 
-    # ── 4. Peel constant factors / addends  c·h(x) or c + h(x) ──────────────
-    #    If expr = c * h(x) or c + h(x) with c free of vars_, recurse on h(x).
     if expr.is_Mul:
         const_part = sp.Integer(1)
         var_part = sp.Integer(1)
         for factor in expr.args:
-            if factor.free_symbols & set(vars_):
-                var_part = var_part * factor
+            if _depends_on_vars(factor, vars_set):
+                var_part *= factor
             else:
-                const_part = const_part * factor
+                const_part *= factor
         if const_part != 1 and var_part != 1:
             sub = _decompose(var_part, vars_)
             if sub is not None:
-                c = const_part
-                inner_f = sub.f_outer
                 t = Dummy("t")
-                outer = sp.Lambda(t, c * inner_f(t))
                 return Decomposition(
-                    outer, sub.g_inner, is_polynomial=sub.is_polynomial
+                    sp.Lambda(t, const_part * sub.f_outer(t)),
+                    sub.g_inner,
+                    sub.is_polynomial,
                 )
 
     if expr.is_Add:
         const_part = sp.Integer(0)
         var_part = sp.Integer(0)
         for term in expr.args:
-            if term.free_symbols & set(vars_):
-                var_part = var_part + term
+            if _depends_on_vars(term, vars_set):
+                var_part += term
             else:
-                const_part = const_part + term
+                const_part += term
         if const_part != 0 and var_part != 0:
             sub = _decompose(var_part, vars_)
             if sub is not None:
-                c = const_part
-                inner_f = sub.f_outer
                 t = Dummy("t")
-                outer = sp.Lambda(t, inner_f(t) + c)
                 return Decomposition(
-                    outer, sub.g_inner, is_polynomial=sub.is_polynomial
+                    sp.Lambda(t, sub.f_outer(t) + const_part),
+                    sub.g_inner,
+                    sub.is_polynomial,
                 )
 
-    # ── 5. Single-variable expression (n=1 or depends on one var only) ────────
-    #    Any single-variable expression is trivially f=identity, g=expr.
-    active = [v for v in vars_ if v in expr.free_symbols]
-    if len(active) == 1:
-        t = Dummy("t")
-        return Decomposition(
-            sp.Lambda(t, t), expr, is_polynomial=_is_polynomial(expr, vars_)
-        )
-
-    # Give up
-    return None
+    return _decompose_shallow(expr, vars_)
 
 
 def _is_polynomial(expr: sp.Expr, vars_: list[sp.Symbol]) -> bool:
@@ -208,11 +415,6 @@ def _is_polynomial(expr: sp.Expr, vars_: list[sp.Symbol]) -> bool:
         return True
     except sp.PolynomialError:
         return False
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# §2  Coefficient extraction (polynomial inner functions only)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _coefficient_arrays(poly: sp.Expr, vars_: list[sp.Symbol]):
@@ -243,11 +445,6 @@ def _coefficient_arrays(poly: sp.Expr, vars_: list[sp.Symbol]):
             A[i, j] = coeff
             A[j, i] = coeff
     return c, b, A
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# §3  Utilities shared across strategies
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _is_even_function(expr: sp.Expr, var: sp.Symbol) -> bool:
@@ -393,13 +590,13 @@ def _real_critical_points(
 ) -> list[sp.Expr]:
     """
     Return sorted list of real critical points of g(var) strictly inside (lo, hi).
-    Includes points where g is not differentiable (e.g. |x| at 0).
+    Includes pts where g is not differentiable (e.g. |x| at 0).
     Cached: S6 and S7 both call this on the same arguments.
     """
     pts = []
 
-    # Stationary points — use a 1-second timeout so transcendental equations
-    # like solve(sin(x)+x*cos(x), x) do not block for several seconds.
+    # Solving g'(x)=0 can explode on transcendental inputs, so cap that step
+    # and continue with any critical points that were found quickly.
     def _solve_timed(expr, var, secs=1.0):
         class _T(Exception):
             pass
@@ -477,11 +674,6 @@ def _g_range_on_interval(
     return sp.Min(*candidates), sp.Max(*candidates)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# §4  Strategies 1–4  (polynomial g – unchanged from original)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 def _try_linear(
     f_outer: Callable,
     g: sp.Expr,
@@ -521,16 +713,32 @@ def _try_linear(
     if not all_pos and not all_neg:
         return None
 
+    def _integrate_timed(expr, bounds, secs=3.0):
+        class _T(Exception):
+            pass
+
+        old = signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(_T()))
+        signal.setitimer(signal.ITIMER_REAL, secs)
+        try:
+            return integrate(expr, bounds, **opts)
+        except _T:
+            return sp.Integral(expr, bounds)
+        except Exception:
+            return None
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
+
     y = Dummy("y")
     abs_b_prod = sp.prod([sp.Abs(bi) for bi in b_list])
     prefactor = sp.Integer(1) / (abs_b_prod * sp.factorial(n - 1))
     if all_pos:
         integrand = prefactor * (y - c) ** (n - 1) * f_outer(y)
-        result = integrate(integrand, (y, c, oo), **opts)
+        result = _integrate_timed(integrand, (y, c, oo))
     else:  # all_neg: g decreases from c to -\infty
         integrand = prefactor * (c - y) ** (n - 1) * f_outer(y)
-        result = integrate(integrand, (y, -oo, c), **opts)
-    return None if result.has(sp.Integral) else result
+        result = _integrate_timed(integrand, (y, -oo, c))
+    return result
 
 
 def _qs_integrate(
@@ -576,7 +784,7 @@ def _try_quadratic_infinite(f_outer, g, vars_, ranges, opts):
     return _qs_integrate(f_outer, A, b_vec, c, len(vars_), opts)
 
 
-def _try_quadratic_even_half_infinite(f_outer, g, vars_, ranges, opts):
+def _try_even_half_quad(f_outer, g, vars_, ranges, opts):
     half = sum(1 for r in ranges if r[1] == 0 and r[2] == oo)
     full = sum(1 for r in ranges if r[1] == -oo and r[2] == oo)
     if half + full != len(vars_):
@@ -614,21 +822,11 @@ def _try_general_polynomial(
     active_vars = [v for v in vars_ if v in g.free_symbols]
     if len(active_vars) > 1:
         return None
-    # Avoid misfiring when inactive dimensions have infinite or dependent bounds.
-    if len(active_vars) == 1:
-        active_set = set(active_vars)
-        active_v = active_vars[0]
-        for v, lo, hi in ranges:
-            lo_s, hi_s = sp.sympify(lo), sp.sympify(hi)
-            if v == active_v and (lo_s.free_symbols | hi_s.free_symbols) & (
-                set(vars_) - {active_v}
-            ):
-                return None
-            if v not in active_set:
-                if lo_s in (-oo, oo) or hi_s in (-oo, oo):
-                    return None
-                if (lo_s.free_symbols | hi_s.free_symbols) & active_set:
-                    return None
+    if (
+        len(active_vars) == 1
+        and _inactive_finite_volume(active_vars, vars_, ranges) is None
+    ):
+        return None
     y = Dummy("y")
     mu_y = _heaviside_to_piecewise(Heaviside(y - g))
     try:
@@ -657,9 +855,127 @@ def _try_general_polynomial(
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# §5  Strategy 5 – Separable g  (new)
-# ═══════════════════════════════════════════════════════════════════════════════
+def _parse_superellipse_core(
+    g: sp.Expr, vars_: list[sp.Symbol]
+) -> tuple[sp.Expr, sp.Expr, dict[sp.Symbol, tuple[sp.Expr, sp.Expr]]] | None:
+    """Return ``(h, k, term_map)`` for g = h**k with h = Σ a_i x_i**p_i."""
+    k = sp.Integer(1)
+    h = g
+    if g.is_Pow:
+        base, exp_ = g.as_base_exp()
+        if exp_.free_symbols or not (exp_.is_positive and exp_.is_real):
+            return None
+        k = sp.sympify(exp_)
+        h = base
+    if not h.is_Add:
+        return None
+    vars_set = set(vars_)
+    term_map: dict[sp.Symbol, tuple[sp.Expr, sp.Expr]] = {}
+    for term in h.args:
+        coeff, rest = term.as_coeff_Mul()
+        coeff = sp.sympify(coeff)
+        active = list(rest.free_symbols & vars_set)
+        if len(active) != 1:
+            return None
+        v = active[0]
+        if v in term_map:
+            return None
+        if not rest.is_Pow or rest.base != v:
+            return None
+        pwr = sp.sympify(rest.exp)
+        if pwr.free_symbols or not (pwr.is_positive and pwr.is_real):
+            return None
+        if coeff.free_symbols or not (coeff.is_positive and coeff.is_real):
+            return None
+        term_map[v] = (coeff, pwr)
+    if set(term_map) != vars_set:
+        return None
+    return h, k, term_map
+
+
+def _split_superellipse(
+    expr: sp.Expr, vars_: list[sp.Symbol]
+) -> tuple[Callable, sp.Expr] | None:
+    """Find a unique superellipse-type inner core inside ``expr``.
+
+    We look for a subexpression of the form ``(Σ a_i x_i**p_i)**k`` and, if it
+    occurs uniquely, replace it by a dummy variable to obtain the outer
+    univariate function.
+    """
+    vars_set = set(vars_)
+    matches = []
+    for sub in sp.preorder_traversal(expr):
+        if sub == expr or not (sub.free_symbols & vars_set):
+            continue
+        if _parse_superellipse_core(sub, vars_) is not None:
+            matches.append(sub)
+    # Prefer the largest matching subexpression and avoid ambiguous cases.
+    uniq = []
+    for m in matches:
+        if not any(
+            other != m and m in sp.preorder_traversal(other) for other in matches
+        ):
+            uniq.append(m)
+    if len(uniq) != 1:
+        return None
+    core = uniq[0]
+    t = Dummy("t_super")
+    outer_expr = expr.xreplace({core: t})
+    if outer_expr.free_symbols & vars_set:
+        return None
+    return sp.Lambda(t, outer_expr), core
+
+
+def _try_superellipse(
+    f_outer: Callable,
+    g: sp.Expr,
+    vars_: list[sp.Symbol],
+    ranges: list[tuple],
+    opts: dict,
+) -> sp.Expr | None:
+    """Fast homogeneous layer-cake for orthant superellipse-type integrals."""
+    if len(vars_) < 2:
+        return None
+
+    for _, lo, hi in ranges:
+        if sp.sympify(lo) != 0 or sp.sympify(hi) != oo:
+            return None
+
+    parsed = _parse_superellipse_core(g, vars_)
+    if parsed is None:
+        return None
+    _, k, term_map = parsed
+
+    alpha = sp.Integer(0)
+    const = sp.Integer(1)
+    for v in vars_:
+        coeff, pwr = term_map[v]
+        alpha += sp.Integer(1) / pwr
+        const *= gamma(1 + sp.Integer(1) / pwr) / coeff ** (sp.Integer(1) / pwr)
+    const /= gamma(1 + alpha)
+
+    t = Dummy("y_super")
+    density = _fast_simplify(const * alpha / k * t ** (alpha / k - 1))
+
+    # Fast divergence detection for positive orthant superellipse densities.
+    # If the outer function tends to +∞, or to a positive nonzero constant, the
+    # weighted tail integral diverges because alpha/k > 0.  This avoids SymPy
+    # producing opaque lowergamma(..., -oo) style results on obvious cases.
+    try:
+        outer_t = f_outer(t)
+        tail_lim = limit(outer_t, t, oo)
+        if tail_lim is oo:
+            return oo
+        if getattr(tail_lim, "is_positive", False) and tail_lim != 0:
+            return oo
+    except Exception:
+        outer_t = f_outer(t)
+
+    try:
+        result = integrate(outer_t * density, (t, 0, oo), **opts)
+    except Exception:
+        return None
+    return None if result.has(sp.Integral) else _fast_simplify(result)
 
 
 def _try_separable(
@@ -815,11 +1131,6 @@ def _try_separable(
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# §5b  Strategy 5b – Product separability  f₁(x₁)·f₂(x₂)·…
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 def _try_product_separable(
     f_expr: sp.Expr, vars_: list[sp.Symbol], ranges: list[tuple], opts: dict
 ) -> sp.Expr | None:
@@ -885,12 +1196,7 @@ def _try_product_separable(
     return _fast_simplify(result)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# §6  Strategy 6 – Monotone substitution  (new)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _try_monotone_substitution(
+def _try_monotone_subst(
     f_outer: Callable,
     g: sp.Expr,
     vars_: list[sp.Symbol],
@@ -998,11 +1304,6 @@ def _try_monotone_substitution(
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# §7  Strategy 7 – Piecewise-monotone substitution  (new)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 def _try_piecewise_monotone(
     f_outer: Callable,
     g: sp.Expr,
@@ -1045,7 +1346,7 @@ def _try_piecewise_monotone(
     for a, b in sub_intervals:
         sub_r = [(xi, a, b)] + other_ranges
         sub_vars = [xi] + [r[0] for r in other_ranges]
-        piece = _try_monotone_substitution(f_outer, g, sub_vars, sub_r, opts)
+        piece = _try_monotone_subst(f_outer, g, sub_vars, sub_r, opts)
         if piece is None:
             try:
                 piece = integrate(f_outer(g) * volume, (xi, a, b), **opts)
@@ -1057,11 +1358,6 @@ def _try_piecewise_monotone(
 
     result = simplify(total)
     return None if result.has(sp.Integral) else result
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# §8  Strategy 8 – General non-polynomial layer-cake  (new)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _bounds_of_g(
@@ -1106,7 +1402,7 @@ def _bounds_of_g(
     return simplify(sp.Min(*vals)), simplify(sp.Max(*vals))
 
 
-def _try_general_nonpolynomial(
+def _try_nonpoly(
     f_outer: Callable,
     g: sp.Expr,
     vars_: list[sp.Symbol],
@@ -1123,9 +1419,7 @@ def _try_general_nonpolynomial(
     Unlike Strategy 4, here g may be transcendental; SymPy must be able to
     integrate Heaviside(y - g(x)) in closed form.
     """
-    # Same guard as S4: skip when g mixes multiple variables.
-    active_vars = [v for v in vars_ if v in g.free_symbols]
-    if len(active_vars) > 1:
+    if not _should_try_layercake(f_outer, g, vars_, ranges):
         return None
 
     yy = Dummy("y_gen")
@@ -1153,11 +1447,6 @@ def _try_general_nonpolynomial(
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# §9  Fallback – plain iterated integration
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 def _iterated_integrate(expr: sp.Expr, ranges: list[tuple], opts: dict) -> sp.Expr:
     """
     Iterated SymPy integration in forward order (first range integrated first).
@@ -1180,11 +1469,6 @@ def _iterated_integrate(expr: sp.Expr, ranges: list[tuple], opts: dict) -> sp.Ex
         else:
             result = integrate(result, (v, lo, hi), **opts)
     return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# §10  Public API
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def multiple_integrate(
@@ -1236,30 +1520,106 @@ def multiple_integrate(
     if assumptions:
         opts["assumptions"] = assumptions
 
-    # Normalise ranges
+    # Normalise ranges or accept a direct Region object.
     parsed_ranges: list[tuple] = []
-    for r in ranges:
-        if len(r) == 3:
-            parsed_ranges.append(tuple(r))
-        else:
-            raise ValueError(f"Each range must be (variable, lower, upper); got {r}")
+    direct_region = None
+    norm_ranges = _normalize_seq(ranges)
+    if len(norm_ranges) == 1 and isinstance(norm_ranges[0], Region):
+        direct_region = norm_ranges[0]
+        parsed_ranges = list(direct_region.ranges)
+    else:
+        for r in norm_ranges:
+            if len(r) == 3:
+                parsed_ranges.append(tuple(r))
+            else:
+                raise ValueError(
+                    f"Each range must be (variable, lower, upper); got {r}"
+                )
 
-    vars_ = [r[0] for r in parsed_ranges]
     f_expr: sp.Expr = sp.sympify(f)
+    region = (
+        direct_region
+        if direct_region is not None
+        else region_from_ranges(parsed_ranges)
+    )
+
+    def _integrate_piecewise(expr_pw: sp.Piecewise):
+        total = sp.Integer(0)
+        remaining = sp.true
+        for branch_expr, branch_cond in expr_pw.args:
+            eff_cond = (
+                remaining
+                if branch_cond in (True, sp.true)
+                else sp.simplify(sp.And(remaining, branch_cond))
+            )
+            sub_region = restrict_region(region, eff_cond)
+            if sub_region is None:
+                try:
+                    direct = sp.integrate(expr_pw, *parsed_ranges, **opts)
+                    if direct is not None and not isinstance(direct, sp.Integral):
+                        return _fast_simplify(direct)
+                except Exception:
+                    return sp.Integral(expr_pw, *parsed_ranges)
+                return sp.Integral(expr_pw, *parsed_ranges)
+            branch_res = multiple_integrate(
+                sp.sympify(branch_expr),
+                sub_region,
+                assumptions=assumptions,
+                generate_conditions=generate_conditions,
+                principal_value=principal_value,
+            )
+            total += branch_res
+            if branch_cond not in (True, sp.true):
+                remaining = sp.simplify(sp.And(remaining, sp.Not(branch_cond)))
+        return _fast_simplify(total)
+
+    vars_ = (
+        list(region.variables)
+        if hasattr(region, "variables")
+        else [r[0] for r in parsed_ranges]
+    )
+    vars_set = _vars_set(vars_)
+
+    # ── First-class indicator and Piecewise handling ────────────────────────
+    # Treat indicator-like Piecewise factors as region restrictions and
+    # integrate general Piecewise expressions branch by branch on supported
+    # regions.
+    if isinstance(f_expr, sp.Piecewise):
+        return _integrate_piecewise(f_expr)
+
+    if isinstance(f_expr, sp.Mul):
+        indicator_conds = []
+        non_indicator = []
+        for arg in f_expr.args:
+            ind_cond = indicator_condition(arg)
+            if ind_cond is not None:
+                indicator_conds.append(ind_cond)
+            else:
+                non_indicator.append(arg)
+        if indicator_conds:
+            restricted = restrict_region(region, sp.And(*indicator_conds))
+            if restricted is not None:
+                new_expr = _fast_simplify(
+                    sp.Mul(*non_indicator) if non_indicator else sp.Integer(1)
+                )
+                return multiple_integrate(
+                    new_expr,
+                    restricted,
+                    assumptions=assumptions,
+                    generate_conditions=generate_conditions,
+                    principal_value=principal_value,
+                )
 
     # Small normalized-subproblem cache shared across recursive calls.
     if not hasattr(multiple_integrate, "_cache"):
         multiple_integrate._cache = {}
 
     def _norm_ranges(rs):
-        return tuple(
-            (v, _fast_simplify(sp.sympify(lo)), _fast_simplify(sp.sympify(hi)))
-            for v, lo, hi in rs
-        )
+        return tuple((v, _clean_expr(lo), _clean_expr(hi)) for v, lo, hi in rs)
 
     cache_key = (
         _fast_simplify(f_expr),
-        _norm_ranges(parsed_ranges),
+        region.normalized_ranges(),
         bool(generate_conditions),
         bool(principal_value),
         repr(assumptions),
@@ -1274,11 +1634,37 @@ def multiple_integrate(
         multiple_integrate._cache[cache_key] = res
         return res
 
-    if not f_expr.free_symbols & set(vars_):
-        volume = sp.Integer(1)
-        for r in parsed_ranges:
-            volume = volume * (sp.sympify(r[2]) - sp.sympify(r[1]))
-        return _store(_fast_simplify(f_expr * volume))
+    if _is_constant_wrt(f_expr, vars_set):
+        return _store(_const_result(f_expr, region, parsed_ranges))
+
+    # ── Region-aware shortcuts ─────────────────────────
+    region_res = _region_shortcut(region, f_expr, assumptions=assumptions)
+    if region_res is not None:
+        return _store(region_res)
+
+    region_res = _try_region_transform(
+        region,
+        f_expr,
+        assumptions=assumptions,
+        generate_conditions=generate_conditions,
+        principal_value=principal_value,
+    )
+    if region_res is not None:
+        return _store(region_res)
+
+    gauss_res = _try_gauss_linear_map(f_expr, parsed_ranges, assumptions=assumptions)
+    if gauss_res is not None:
+        return _store(gauss_res)
+
+    reversed_res = _try_graph_reversal(
+        f_expr,
+        region,
+        assumptions,
+        generate_conditions,
+        principal_value,
+    )
+    if reversed_res is not None:
+        return _store(reversed_res)
 
     # ── Aggressive sum splitting ───────────────────────────────────────────
     parts = _split_additive_terms(f_expr)
@@ -1310,11 +1696,8 @@ def multiple_integrate(
         if f_norm != f_expr:
             f_expr = f_norm
             # Re-run constant check after normalisation
-            if not f_expr.free_symbols & set(vars_):
-                volume = sp.Integer(1)
-                for r in parsed_ranges:
-                    volume = volume * (sp.sympify(r[2]) - sp.sympify(r[1]))
-                return _store(_fast_simplify(f_expr * volume))
+            if _is_constant_wrt(f_expr, vars_set):
+                return _store(_const_result(f_expr, region, parsed_ranges))
     except Exception:
         pass
 
@@ -1338,20 +1721,22 @@ def multiple_integrate(
     scale = sp.Integer(1)
     for i, r in enumerate(new_ranges):
         v, lo, hi = r
-        lo_s, hi_s = sp.sympify(lo), sp.sympify(hi)
-        if _is_symmetric_range(lo_s, hi_s):
-            try:
-                reflected = f_expr.subs(v, -v)
-                if sp.simplify(reflected + f_expr) == 0:  # odd → zero
-                    return sp.Integer(0)
-                if sp.simplify(reflected - f_expr) == 0:  # even → halve range
-                    new_ranges[i] = (v, sp.Integer(0), hi_s)
-                    scale = scale * 2
-            except Exception:
-                pass
+        sym_range = region.symmetric_range(v)
+        if sym_range is None:
+            continue
+        _, hi_s = sym_range
+        try:
+            reflected = f_expr.subs(v, -v)
+            if sp.simplify(reflected + f_expr) == 0:  # odd → zero
+                return sp.Integer(0)
+            if sp.simplify(reflected - f_expr) == 0:  # even → halve range
+                new_ranges[i] = (v, sp.Integer(0), hi_s)
+                scale = scale * 2
+        except Exception:
+            pass
     if scale != 1:
         parsed_ranges = new_ranges
-        f_expr = f_expr  # integrand unchanged; only range shortened
+        region = region_from_ranges(parsed_ranges)
 
     # ── Helpers to apply even-halving scale to any returned result ────────────
     def _scaled(r):
@@ -1366,7 +1751,7 @@ def multiple_integrate(
     # If some integration variables do not appear in f_expr, factor out their
     # volume contribution and recurse on the remaining variables.
     # E.g. ∫∫∫ (sin(x)+cos(z)) dx dy dz = (b_y-a_y) * ∫∫ (sin(x)+cos(z)) dx dz
-    active_vars = f_expr.free_symbols & set(vars_)
+    active_vars = f_expr.free_symbols & vars_set
     if active_vars != set(vars_) and active_vars:
         inactive_ranges = [r for r in parsed_ranges if r[0] not in active_vars]
         active_ranges = [r for r in parsed_ranges if r[0] in active_vars]
@@ -1442,7 +1827,7 @@ def multiple_integrate(
     # powsimp merges exponential products so S1/S2 can recognise them;
     # it is cheap (single-pass) and never changes the value.
     f_simplified = sp.powsimp(f_expr, force=True)
-    if f_simplified != f_expr and not f_simplified.free_symbols - set(vars_):
+    if f_simplified != f_expr and not f_simplified.free_symbols - vars_set:
         f_expr = f_simplified
 
     # ── Pull out constant factors ────────────────────────────────────────────
@@ -1450,7 +1835,9 @@ def multiple_integrate(
     # ∫ h dxⁿ, and multiply back. This ensures downstream strategies always
     # see a "pure" integrand without stray scalar prefactors.
     if f_expr.is_Mul:
-        c_factors = [a for a in f_expr.args if not a.free_symbols & set(vars_)]
+        c_factors = [
+            a for a in f_expr.args if not sp.sympify(a).free_symbols & vars_set
+        ]
         if c_factors:
             c_out = sp.Mul(*c_factors)
             h_expr = f_expr / c_out
@@ -1463,40 +1850,66 @@ def multiple_integrate(
             )
             return _store(_fast_simplify(_scaled(c_out * inner)))
 
+    # ── Direct superellipse shortcut ─────────────────────────────────────────
+    # Some hard reference cases have an outer wrapper like 1/(1+g) or exp(-g)
+    # around a homogeneous power-sum g.  Recover that structure directly from
+    # the full integrand so we can avoid extremely slow symbolic Heaviside
+    # integration in the generic layer-cake path.
+    super_decomp = _split_superellipse(f_expr, vars_)
+    if super_decomp is not None:
+        super_outer, super_g = super_decomp
+        super_res = _try_superellipse(super_outer, super_g, vars_, parsed_ranges, opts)
+        if super_res is not None:
+            return _store(_scaled(super_res))
+
     # ── Decompose integrand into f_outer ∘ g ──────────────────────────────────
     @functools.lru_cache(maxsize=256)
     def _decompose_cached(expr, vars_tuple):
-        return _decompose(expr, list(vars_tuple))
+        return _decompose_shallow(expr, list(vars_tuple))
 
     decomp = _decompose_cached(f_expr, tuple(vars_))
 
     if decomp is None:
         return _store(_scaled(_iterated_integrate(f_expr, parsed_ranges, opts)))
 
-    f_outer = decomp.f_outer
-    g = decomp.g_inner
-    is_poly = decomp.is_polynomial
+    def _run_strategies(cur_decomp):
+        f_outer = cur_decomp.f_outer
+        g = cur_decomp.g_inner
+        is_poly = cur_decomp.is_polynomial
 
-    # ── Strategies 1–4: polynomial g ──────────────────────────────────────────
-    if is_poly:
+        if is_poly:
+            for strategy in (
+                _try_linear,
+                _try_quadratic_infinite,
+                _try_even_half_quad,
+                _try_superellipse,
+                _try_general_polynomial,
+            ):
+                res = strategy(f_outer, g, vars_, parsed_ranges, opts)
+                if res is not None:
+                    return res
+
         for strategy in (
-            _try_linear,
-            _try_quadratic_infinite,
-            _try_quadratic_even_half_infinite,
-            _try_general_polynomial,
+            _try_separable,
+            _try_monotone_subst,
+            _try_piecewise_monotone,
+            _try_nonpoly,
         ):
             res = strategy(f_outer, g, vars_, parsed_ranges, opts)
             if res is not None:
-                return _store(_scaled(res))
+                return res
+        return None
 
-    # ── Strategies 5–8: non-polynomial g ──────────────────────────────────────
-    for strategy in (
-        _try_separable,
-        _try_monotone_substitution,
-        _try_piecewise_monotone,
-        _try_general_nonpolynomial,
+    res = _run_strategies(decomp)
+    if res is not None:
+        return _store(_scaled(res))
+
+    deep_decomp = _decompose(f_expr, vars_)
+    if deep_decomp is not None and (
+        deep_decomp.g_inner != decomp.g_inner
+        or deep_decomp.f_outer(sp.Symbol("_u")) != decomp.f_outer(sp.Symbol("_u"))
     ):
-        res = strategy(f_outer, g, vars_, parsed_ranges, opts)
+        res = _run_strategies(deep_decomp)
         if res is not None:
             return _store(_scaled(res))
 
@@ -1505,9 +1918,394 @@ def multiple_integrate(
     return _store(_fast_simplify(scale * result) if scale != 1 else result)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# §11  Self-test
-# ═══════════════════════════════════════════════════════════════════════════════
+def _simplex_poly(region: Region, expr: sp.Expr) -> sp.Expr | None:
+    """Exact polynomial moments on simplex-like regions."""
+    if isinstance(region, (SimplexRegion, AffineSimplexRegion)):
+        return region.polynomial_moment(expr)
+    return None
+
+
+def _standard_ball_ranges(
+    vars_: tuple[sp.Symbol, ...], radius: sp.Expr
+) -> tuple[tuple, ...]:
+    """SymPy-style inner-first iterated ranges for a standard ball."""
+    outer_first = []
+    sumsq = sp.Integer(0)
+    for i, v in enumerate(vars_):
+        if i == 0:
+            outer_first.append((v, -radius, radius))
+        else:
+            rad = sp.sqrt(radius**2 - sumsq)
+            outer_first.append((v, -rad, rad))
+        sumsq += v**2
+    return tuple(reversed(outer_first))
+
+
+def _polar_disk_transform(region: DiskRegion) -> CoordinateTransform:
+    x, y = region.variables
+    r = sp.Symbol("_r", nonnegative=True, real=True)
+    theta = sp.Symbol("_theta", real=True)
+    return CoordinateTransform(
+        source_vars=(x, y),
+        target_vars=(theta, r),
+        forward_map=(r * sp.cos(theta), r * sp.sin(theta)),
+        jacobian=r,
+        target_ranges=((theta, 0, 2 * sp.pi), (r, 0, region.radius)),
+    )
+
+
+def _ball_spherical_map(region: BallRegion) -> CoordinateTransform | None:
+    if region.dimension != 3 or len(region.variables) != 3:
+        return None
+    x, y, z = region.variables
+    r = sp.Symbol("_r", nonnegative=True, real=True)
+    phi = sp.Symbol("_phi", real=True)
+    theta = sp.Symbol("_theta", real=True)
+    return CoordinateTransform(
+        source_vars=(x, y, z),
+        target_vars=(theta, phi, r),
+        forward_map=(
+            r * sp.sin(phi) * sp.cos(theta),
+            r * sp.sin(phi) * sp.sin(theta),
+            r * sp.cos(phi),
+        ),
+        jacobian=r**2 * sp.sin(phi),
+        target_ranges=((theta, 0, 2 * sp.pi), (phi, 0, sp.pi), (r, 0, region.radius)),
+    )
+
+
+def _affine_region_transform(region: Region) -> CoordinateTransform | None:
+    if isinstance(region, EllipsoidRegion):
+        vars_ = tuple(region.variables_nd)
+        uvars = sp.symbols(f"_u0:{len(vars_)}", real=True)
+        jac = sp.Integer(1)
+        forward = []
+        for a, u in zip(region.axes, uvars):
+            jac *= sp.Abs(sp.sympify(a))
+            forward.append(sp.sympify(a) * u)
+        return CoordinateTransform(
+            source_vars=vars_,
+            target_vars=tuple(reversed(uvars)),
+            forward_map=tuple(forward),
+            jacobian=jac,
+            target_ranges=_standard_ball_ranges(uvars, sp.Integer(1)),
+        )
+    if isinstance(region, AnnulusRegion):
+        x, y = region.variables_xy
+        r = sp.Symbol("_r", nonnegative=True, real=True)
+        theta = sp.Symbol("_theta", real=True)
+        return CoordinateTransform(
+            source_vars=(x, y),
+            target_vars=(theta, r),
+            forward_map=(r * sp.cos(theta), r * sp.sin(theta)),
+            jacobian=r,
+            target_ranges=(
+                (theta, 0, 2 * sp.pi),
+                (r, region.inner_radius, region.outer_radius),
+            ),
+        )
+    if isinstance(region, SphericalShellRegion) and len(region.variables_nd) == 3:
+        x, y, z = region.variables_nd
+        r = sp.Symbol("_r", nonnegative=True, real=True)
+        phi = sp.Symbol("_phi", real=True)
+        theta = sp.Symbol("_theta", real=True)
+        return CoordinateTransform(
+            source_vars=(x, y, z),
+            target_vars=(theta, phi, r),
+            forward_map=(
+                r * sp.sin(phi) * sp.cos(theta),
+                r * sp.sin(phi) * sp.sin(theta),
+                r * sp.cos(phi),
+            ),
+            jacobian=r**2 * sp.sin(phi),
+            target_ranges=(
+                (theta, 0, 2 * sp.pi),
+                (phi, 0, sp.pi),
+                (r, region.inner_radius, region.outer_radius),
+            ),
+        )
+    return None
+
+
+def _try_transform(
+    transform: CoordinateTransform,
+    expr: sp.Expr,
+    *,
+    assumptions,
+    generate_conditions,
+    principal_value,
+) -> sp.Expr | None:
+    transformed_expr = transform.apply(expr)
+    if any(v in transformed_expr.free_symbols for v in transform.source_vars):
+        return None
+    try:
+        return multiple_integrate(
+            transformed_expr,
+            *transform.target_ranges,
+            assumptions=assumptions,
+            generate_conditions=generate_conditions,
+            principal_value=principal_value,
+        )
+    except Exception:
+        return None
+
+
+def _try_region_transform(
+    region: Region, expr: sp.Expr, *, assumptions, generate_conditions, principal_value
+) -> sp.Expr | None:
+    if isinstance(region, DiskRegion):
+        val = _try_transform(
+            _polar_disk_transform(region),
+            expr,
+            assumptions=assumptions,
+            generate_conditions=generate_conditions,
+            principal_value=principal_value,
+        )
+        if val is not None:
+            return val
+    if isinstance(region, BallRegion):
+        tfm = _ball_spherical_map(region)
+        if tfm is not None:
+            val = _try_transform(
+                tfm,
+                expr,
+                assumptions=assumptions,
+                generate_conditions=generate_conditions,
+                principal_value=principal_value,
+            )
+            if val is not None:
+                return val
+    tfm = _affine_region_transform(region)
+    if tfm is not None:
+        val = _try_transform(
+            tfm,
+            expr,
+            assumptions=assumptions,
+            generate_conditions=generate_conditions,
+            principal_value=principal_value,
+        )
+        if val is not None:
+            return val
+    return None
+
+
+def _symbolically_positive(expr: sp.Expr, assumptions=None) -> bool:
+    """Best-effort positivity test for structured convergence checks."""
+    expr = sp.sympify(expr)
+    if expr.is_positive is True:
+        return True
+    if assumptions and isinstance(assumptions, dict):
+        if expr.is_Symbol and assumptions.get(str(expr)) in ("positive", True):
+            return True
+    try:
+        val = sp.N(expr)
+        if val.is_real and float(val) > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _simplex_dirichlet_term(term: sp.Expr, vars_: tuple[sp.Symbol, ...]):
+    """Parse coeff * prod(x_i**a_i) * (1-sum x_i)**b for a simplex term."""
+    term = sp.factor_terms(sp.sympify(term))
+    rem = sp.expand(1 - sum(vars_))
+    coeff = sp.Integer(1)
+    exponents = {v: sp.Integer(0) for v in vars_}
+    rem_exp = sp.Integer(0)
+    factors = term.args if term.is_Mul else (term,)
+    for factor in factors:
+        factor = sp.sympify(factor)
+        if not (factor.free_symbols & set(vars_)):
+            coeff *= factor
+            continue
+        base, exp = factor.as_base_exp()
+        base = sp.expand(base)
+        if base in exponents:
+            exponents[base] += exp
+            continue
+        if sp.simplify(base - rem) == 0:
+            rem_exp += exp
+            continue
+        return None
+    return coeff, tuple(exponents[v] for v in vars_), rem_exp
+
+
+def _simplex_dirichlet(
+    region: Region, expr: sp.Expr, assumptions=None
+) -> sp.Expr | None:
+    """Exact Dirichlet-type integration on standard and affine simplices."""
+    if isinstance(region, AffineSimplexRegion):
+        vars_ = region.variables
+        uvars = sp.symbols(f"_u0:{region.dimension}", real=True)
+        subs = {
+            v: sp.sympify(a) + sp.sympify(s) * u
+            for v, a, s, u in zip(vars_, region.shifts, region.scales, uvars)
+        }
+        jac = sp.Integer(1)
+        for s in region.scales:
+            jac *= sp.Abs(sp.sympify(s))
+        transformed = sp.expand(sp.sympify(expr).subs(subs) * jac)
+        simplex_ranges = tuple((u, 0, 1 - sum(uvars[:i])) for i, u in enumerate(uvars))
+        simplex = SimplexRegion(simplex_ranges, dimension=region.dimension)
+        return _simplex_dirichlet(simplex, transformed, assumptions=assumptions)
+
+    if not isinstance(region, SimplexRegion):
+        return None
+
+    vars_ = tuple(region.variables)
+    expr = sp.sympify(expr)
+    total = sp.Integer(0)
+    terms = expr.args if expr.is_Add else (expr,)
+    for term in terms:
+        parsed = _simplex_dirichlet_term(term, vars_)
+        if parsed is None:
+            return None
+        coeff, exponents, rem_exp = parsed
+        alphas = [sp.simplify(e + 1) for e in exponents] + [sp.simplify(rem_exp + 1)]
+        if any(a.is_nonpositive is True for a in alphas):
+            return None
+        if any(
+            (a.is_positive is not True)
+            and not _symbolically_positive(a, assumptions=assumptions)
+            for a in alphas
+        ):
+            return None
+        numer = coeff
+        for a in alphas:
+            numer *= sp.gamma(a)
+        total += numer / sp.gamma(sp.Add(*alphas))
+    return _fast_simplify(total)
+
+
+def _try_gauss_linear_map(
+    expr: sp.Expr, parsed_ranges: list[tuple], assumptions=None
+) -> sp.Expr | None:
+    vars_ = tuple(r[0] for r in parsed_ranges)
+    if not vars_ or not all(
+        sp.sympify(lo) == -sp.oo and sp.sympify(hi) == sp.oo
+        for _, lo, hi in parsed_ranges
+    ):
+        return None
+    expr = sp.sympify(expr)
+    if expr.func != sp.exp or len(expr.args) != 1:
+        return None
+    q = sp.expand(expr.args[0])
+    if any(
+        v in sp.sympify(lo).free_symbols or v in sp.sympify(hi).free_symbols
+        for v, lo, hi in parsed_ranges
+    ):
+        return None
+    H = sp.hessian(q, vars_)
+    A = sp.simplify(-H / 2)
+    try:
+        if any(entry.free_symbols & set(vars_) for entry in A):
+            return None
+    except Exception:
+        return None
+    quad = sp.expand((sp.Matrix(vars_).T * A * sp.Matrix(vars_))[0])
+    linear_part = sp.expand(q + quad)
+    b_entries = []
+    for v in vars_:
+        dv = sp.diff(linear_part, v)
+        if dv.free_symbols & set(vars_):
+            return None
+        b_entries.append(sp.simplify(dv))
+    bvec = sp.Matrix(b_entries)
+    c = sp.simplify(linear_part - sum(b * v for b, v in zip(b_entries, vars_)))
+    if c.free_symbols & set(vars_):
+        return None
+    detA = sp.simplify(A.det())
+    if detA == 0:
+        return None
+    try:
+        if A.is_positive_definite is False:
+            return None
+    except Exception:
+        pass
+    if A.is_positive_definite is not True:
+        # Avoid returning branch-sensitive square roots unless positivity is clear.
+        return None
+    try:
+        shift_term = sp.simplify((bvec.T * A.LUsolve(bvec))[0] / 4)
+    except Exception:
+        return None
+    return sp.simplify(
+        sp.pi ** (sp.Rational(len(vars_), 2)) * sp.exp(c + shift_term) / sp.sqrt(detA)
+    )
+
+
+def _region_shortcut(region: Region, expr: sp.Expr, assumptions=None) -> sp.Expr | None:
+    """Exact moments and simple radial integrals on recognized regions."""
+    if isinstance(region, UnionRegion):
+        total = sp.Integer(0)
+        for piece in region.pieces:
+            val = _region_shortcut(piece, expr, assumptions=assumptions)
+            if val is None:
+                return None
+            total += val
+        return sp.simplify(total)
+
+    if isinstance(region, (SimplexRegion, AffineSimplexRegion)):
+        poly_res = region.polynomial_moment(expr)
+        if poly_res is not None:
+            return poly_res
+        dirichlet_res = _simplex_dirichlet(region, expr, assumptions=assumptions)
+        if dirichlet_res is not None:
+            return dirichlet_res
+
+    if isinstance(
+        region,
+        (DiskRegion, BallRegion, EllipsoidRegion, AnnulusRegion, SphericalShellRegion),
+    ):
+        poly_res = region.polynomial_moment(expr)
+        if poly_res is not None:
+            return poly_res
+        return region.radial_integral(expr)
+
+    return None
+
+
+def _try_graph_reversal(
+    expr: sp.Expr,
+    region: Region,
+    assumptions,
+    generate_conditions: bool,
+    principal_value: bool,
+) -> sp.Expr | None:
+    """Safely reverse simple 2-D graph regions when it reduces dependency.
+
+    The current Phase 2 heuristic only fires when the integrand depends on the
+    inner variable but not the outer one.  Reversing then converts the problem
+    into one where the first integration produces a simple geometric factor.
+    """
+    if not isinstance(region, GraphRegion):
+        return None
+    if region.outer_var is None or region.inner_var is None:
+        return None
+    outer = region.outer_var
+    inner = region.inner_var
+    if outer in expr.free_symbols or inner not in expr.free_symbols:
+        return None
+    pieces = region.reversed_pieces()
+    if not pieces:
+        return None
+
+    total = sp.Integer(0)
+    for piece in pieces:
+        # reversed_pieces() now returns inner-first tuples, matching the public
+        # SymPy convention: integrate x over [x_lo, x_hi] first, then y.
+        (_, inner_lo, inner_hi), (outer, lo, hi) = piece
+        weight = _fast_simplify(sp.sympify(inner_hi) - sp.sympify(inner_lo))
+        total += multiple_integrate(
+            _fast_simplify(weight * expr),
+            (outer, lo, hi),
+            assumptions=assumptions,
+            generate_conditions=generate_conditions,
+            principal_value=principal_value,
+        )
+    return _fast_simplify(total)
+
 
 if __name__ == "__main__":
     x, y, z = symbols("x y z", real=True)
@@ -1560,7 +2358,7 @@ if __name__ == "__main__":
         (
             "cos(x+y)  [0,π]²  (separable sum)",
             lambda: multiple_integrate(sp.cos(x + y), (x, 0, pi), (y, 0, pi)),
-            sp.Integer(0),
+            -4,
         ),
         # ── Non-polynomial g: monotone substitution ───────────────────────────
         (

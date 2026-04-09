@@ -7,29 +7,29 @@
 ### Summary
 
 Major extension of the integration engine to support non-polynomial inner
-functions $g(\mathbf{x})$. The original implementation only handled $g$ 
-that were polynomials in the integration variables. This release adds 
+functions $g(\mathbf{x})$. The original implementation only handled $g$
+that were polynomials in the integration variables. This release adds
 four new strategies (S5–S8) and a completely rewritten decomposition layer.
 
 ### New features
 
 #### Strategies 5–8 for non-polynomial $g$
 
-**Strategy 5 — Separable $g$**  
+**Strategy 5 — Separable $g$**
 Handles $g(\mathbf{x}) = h_1(x_1) + h_2(x_2) + \cdots + h_n(x_n)$ where each
 term depends on exactly one variable. The layer-cake density is computed as the
 convolution of the marginal Lebesgue pushforward densities $\nu_i$.
 
 Examples now handled: `cos(x+y)`, `exp(-(x+y))`, `sin(x)+sin(y)`, `log(x+y)`.
 
-**Strategy 6 — Monotone substitution**  
+**Strategy 6 — Monotone substitution**
 For single-variable $g$ with no interior critical points on the integration
 interval. Inverts $g$ analytically via `sympy.solve`, computes the Jacobian
 $|dx/dy|$, and reduces to a 1-D integral.
 
 Examples now handled: `exp(x)`, `log(x)`, `1/(1+x²)`, `sqrt(x)`, `x^(1/3)`.
 
-**Strategy 7 — Piecewise-monotone substitution**  
+**Strategy 7 — Piecewise-monotone substitution**
 Extends S6 to $g$ with interior critical points by splitting the domain at each
 critical point. Also detects non-differentiable kinks (zeros of `Abs` arguments
 and `sqrt` radicands).
@@ -37,7 +37,7 @@ and `sqrt` radicands).
 Examples now handled: `sin(x)` on `[0,π]`, `cos(x)` on `[0,2π]`, `Abs(x)`,
 `Abs(sin(x))`.
 
-**Strategy 8 — General non-polynomial Heaviside layer-cake**  
+**Strategy 8 — General non-polynomial Heaviside layer-cake**
 For multi-variable non-polynomial $g$ where none of S5–S7 applies. Uses the
 same Heaviside-integral algorithm as S4 but without the polynomial restriction.
 
@@ -94,24 +94,24 @@ a polynomial in the integration variables.
 
 ### Features
 
-**Strategy 1 — Linear polynomial over $[0,\infty)^n$**  
+**Strategy 1 — Linear polynomial over $[0,\infty)^n$**
 Implements the simplex measure formula:
 
 $$\int_{[0,\infty)^n} f(\mathbf{b}\cdot\mathbf{x}+c)\,d\mathbf{x}
 = \frac{1}{\prod b_i\,(n-1)!}\int_c^\infty (y-c)^{n-1}\,f(y)\,dy$$
 
-**Strategy 2 — Quadratic doubly-infinite**  
+**Strategy 2 — Quadratic doubly-infinite**
 Implements the ellipsoid surface-area formula for Gaussian-type integrals over
 $\mathbb{R}^n$.
 
-**Strategy 3 — Quadratic even / half-infinite**  
+**Strategy 3 — Quadratic even / half-infinite**
 Exploits symmetry to halve each half-infinite dimension.
 
-**Strategy 4 — General polynomial, Heaviside layer-cake**  
+**Strategy 4 — General polynomial, Heaviside layer-cake**
 Computes $\mu(y) = \int_\Omega \Theta(y - g(\mathbf{x}))\,d\mathbf{x}$ symbolically
 for any polynomial $g$ on any domain that SymPy can handle.
 
-**Strategy 9 — Fallback**  
+**Strategy 9 — Fallback**
 Plain iterated `sympy.integrate`.
 
 ### Known limitations in v1.0

@@ -67,11 +67,11 @@ class TestSupportedFamiliesMatrix:
 
 @pytest.mark.xfail(reason="General dependent-bound simplex support is still incomplete")
 def test_simplex_area_with_dependent_bounds():
-    result = multiple_integrate(1, (x, 0, 1), (y, 0, 1 - x))
+    result = multiple_integrate(1, (y, 0, 1 - x), (x, 0, 1))
     assert_eq(result, Rational(1, 2), "Triangle area over a simplex domain")
 
 
 @pytest.mark.xfail(reason="General dependent-bound simplex support is still incomplete")
 def test_simplex_xy_moment_with_dependent_bounds():
-    result = multiple_integrate(x * y, (x, 0, 1), (y, 0, 1 - x))
+    result = multiple_integrate(x * y, (y, 0, 1 - x), (x, 0, 1))
     assert_eq(result, Rational(1, 24), "Triangle xy moment over a simplex domain")

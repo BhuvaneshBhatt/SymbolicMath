@@ -63,12 +63,12 @@ from multiple_integrate.core import (
     _is_polynomial,
     _try_linear,
     _try_quadratic_infinite,
-    _try_quadratic_even_half_infinite,
+    _try_even_half_quad,
     _try_general_polynomial,
     _try_separable,
-    _try_monotone_substitution,
+    _try_monotone_subst,
     _try_piecewise_monotone,
-    _try_general_nonpolynomial,
+    _try_nonpoly,
 )
 
 x, y, z = symbols("x y z", real=True)
@@ -153,25 +153,34 @@ class TestDecompose:
         assert not d.is_polynomial
 
     def test_power_constant_exponent(self):
-        # (x²+1)**(3/2) → f = t**(3/2), g = x²+1
+        # Deep decomposition now peels to the single-variable core g = x.
         expr = (x**2 + 1) ** Rational(3, 2)
         d = _decompose(expr, [x])
         assert d is not None
-        assert sym_eq(d.g_inner, x**2 + 1)
+        assert sym_eq(d.g_inner, x)
+        assert sym_eq(d.f_outer(x), expr)
         assert d.is_polynomial
 
     def test_constant_factor_peeled(self):
-        # 3*sin(x) → f = 3t, g = sin(x)
+        # 3*sin(x) → deep decomposition peels to g = x, f = 3*sin(t)
         d = _decompose(3 * sin(x), [x])
         assert d is not None
-        # f_outer(1) should be 3
-        assert sym_eq(d.f_outer(Integer(1)), Integer(3))
+        assert sym_eq(d.g_inner, x)
+        assert sym_eq(d.f_outer(x), 3 * sin(x))
 
     def test_constant_addend_peeled(self):
-        # sin(x) + 2 → f = t+2, g = sin(x)
+        # sin(x) + 2 → deep decomposition peels to g = x, f = sin(t)+2
         d = _decompose(sin(x) + 2, [x])
         assert d is not None
-        assert sym_eq(d.f_outer(Integer(0)), Integer(2))
+        assert sym_eq(d.g_inner, x)
+        assert sym_eq(d.f_outer(x), sin(x) + 2)
+
+    def test_nested_power_plus_constant_decomposes_to_single_variable_core(self):
+        expr = 1 / (1 + (x**2 + 1) ** 2)
+        d = _decompose(expr, [x])
+        assert d is not None
+        assert sym_eq(d.g_inner, x)
+        assert sym_eq(d.f_outer(x), expr)
 
     def test_single_active_variable(self):
         # exp(-x) in variables [x, y] — only x active
